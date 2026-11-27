@@ -1,133 +1,206 @@
-"""News image, 27 November 2026 — make.fun entry.
+"""Validate and deliver the make.fun news-image entry for 27 November 2026.
 
-Entry: a newspaper front page summing up Friday 27 November 2026's world
-news in one image (1024x1024 PNG, 756,087 bytes):
-  masthead "THE WORLD TODAY — FRIDAY, 27 NOVEMBER 2026";
-  hero: drones over Kuwait — two Italian technicians killed at an
-  air-defence station; Italy and Kuwait blame Iran, Tehran denies it;
-  panels: Israeli strikes kill 10 in Gaza and Hamas weighs a response,
-  a diesel tanker capsizes off Ibiza killing one, Black Friday crowds
-  return with 126 million expected to shop, Gukesh and Sindarov draw
-  marathon Game 3 of the World Championship;
-  footer strip: UK net migration falls to 77,000 (lowest since 1997),
-  Depardieu to stand trial, Zelenskyy warns of a new Russian strike on
-  the power grid, India's top court quashes an ex-MP's early release,
-  a tanker blast near the Strait of Hormuz, Hong Kong marks the Tai Po
-  fire anniversary. 14 stories in total.
+The entry image is a 1024x1024 newspaper front page, "THE WORLD TODAY --
+FRIDAY, 27 NOVEMBER 2026", summing up the day's world news in 14 stories:
+a hero panel on the drones over Kuwait in which two Italian technicians
+were killed, plus panels on Gaza, the Ibiza tanker, Black Friday, and chess,
+and an ALSO TODAY footer covering UK migration, Depardieu, Zelenskyy, the
+India court ruling, the Hormuz tanker, and the Hong Kong anniversary.
 
-Chosen by an internal pairwise tournament over 16 candidate compositions,
-judged against the published judge brief in weight order — see
-CANDIDATES.md. The champion (C1) beats the runner-up (C4, split hero) in
-the final on the brief's second and third criteria: it names 14 stories
-instead of 13 and its single full-width hero reads more clearly at 300px
-than two half-width heroes.
+The image lives in this repository as ``entry.png`` (756,087 bytes). This
+program reads it, checks it thoroughly, and copies it to the output
+directory make.fun expects::
 
-Writes entry.png to $MAKEFUN_OUTPUT_DIR/entry.png (default /output/entry.png),
-then self-verifies: PNG signature, size at most 1048576 bytes, dimensions at
-most 1024x1024, and re-reads the written file to confirm it is byte-identical
-to the repository's entry.png. Exits non-zero on any failure.
+    $MAKEFUN_OUTPUT_DIR/entry.png        (default: /output/entry.png)
 
-Revision note: dimension check reads the PNG IHDR with the standard library
-only (no Pillow at grade time); the byte-identity check was added as a second
-revision after the first draft only printed the write; a third revision made
-the check walk every chunk and verify each CRC after a truncated file passed
-on its header alone. A fourth revision re-checked the docstring's byte count
-against the built entry.png (756,087 bytes) and confirmed two runs of main.py
-write byte-identical output (sha256 db828bdb…).
+Only the Python standard library is used. Any problem -- a bad signature,
+an oversized file, a dimension over 1024, a chunk with a wrong CRC, a
+missing or misplaced IEND chunk, a truncated file, or a written copy that
+does not match the source byte for byte -- is a hard failure: the program
+prints an error to stderr and exits non-zero. On success it prints the
+byte count and the dimensions.
 """
+
+from __future__ import annotations
 
 import os
 import struct
 import sys
 import zlib
+from pathlib import Path
 
-MAX_BYTES = 1048576
-MAX_DIM = 1024
+# The eight bytes every PNG file starts with.
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+# make.fun's limits for this bounty.
+MAX_FILE_BYTES = 1_048_576
+MAX_SIDE_PIXELS = 1024
+
+# Chunk layout: 4-byte big-endian length, 4-byte type, payload, 4-byte CRC.
+_CHUNK_HEADER = 8   # length + type
+_CHUNK_FOOTER = 4   # CRC
+_IHDR_PAYLOAD = 13
 
 
-def png_dimensions(data: bytes) -> tuple:
-    """Validate a whole PNG and return (width, height).
+class EntryProblem(Exception):
+    """Raised when the entry image (or its written copy) fails a check."""
 
-    Walks every chunk, checks each CRC, and requires IEND to end the file,
-    so a truncated or corrupt file is rejected instead of passing on its
-    header alone.
+
+def _u32be(raw: bytes) -> int:
+    """Decode one big-endian unsigned 32-bit integer."""
+    return struct.unpack(">I", raw)[0]
+
+
+def _crc_matches(chunk_type: bytes, payload: bytes, stored_crc: int) -> bool:
+    """True when the stored CRC equals the CRC of type + payload."""
+    return zlib.crc32(chunk_type + payload) & 0xFFFFFFFF == stored_crc
+
+
+def examine_png(blob: bytes) -> tuple[int, int]:
+    """Walk a PNG byte string end to end and return ``(width, height)``.
+
+    Checks, in order: overall size, the PNG signature, a well-formed
+    first chunk (IHDR, exactly 13 payload bytes, sane dimensions), then
+    every chunk in turn -- length fields that stay inside the file, a
+    matching CRC for each chunk -- and finally that the file ends exactly
+    at the end of the IEND chunk, with no trailing bytes and no chunk
+    after IEND.
     """
-    if len(data) < 33 or data[:8] != b"\x89PNG\r\n\x1a\n":
-        raise ValueError("not a PNG file (bad signature)")
-    pos = 8
-    width = height = None
-    seen_iend = False
-    while pos < len(data):
-        if pos + 8 > len(data):
-            raise ValueError("truncated PNG chunk header")
-        length = struct.unpack(">I", data[pos:pos + 4])[0]
-        ctype = data[pos + 4:pos + 8]
-        end = pos + 8 + length + 4
-        if end > len(data):
-            raise ValueError(f"truncated PNG chunk {ctype!r}")
-        chunk = data[pos + 4:end - 4]
-        crc_stored = struct.unpack(">I", data[end - 4:end])[0]
-        if zlib.crc32(chunk) & 0xFFFFFFFF != crc_stored:
-            raise ValueError(f"bad CRC in PNG chunk {ctype!r}")
-        if ctype == b"IHDR":
-            if pos != 8 or length != 13:
-                raise ValueError("bad IHDR")
-            width, height = struct.unpack(">II", data[pos + 8:pos + 16])
-        if ctype == b"IEND":
-            seen_iend = True
-            if end != len(data):
-                raise ValueError("trailing data after IEND")
-        pos = end
-    if width is None or not seen_iend:
-        raise ValueError("PNG missing IHDR or IEND")
+    if len(blob) > MAX_FILE_BYTES:
+        raise EntryProblem(
+            f"entry.png is {len(blob)} bytes, over the limit of "
+            f"{MAX_FILE_BYTES} bytes"
+        )
+    if len(blob) < len(PNG_MAGIC) + _CHUNK_HEADER + _IHDR_PAYLOAD + _CHUNK_FOOTER:
+        raise EntryProblem("entry.png is too short to be a PNG file")
+    if blob[: len(PNG_MAGIC)] != PNG_MAGIC:
+        raise EntryProblem("entry.png does not start with the PNG signature")
+
+    width = height = 0
+    offset = len(PNG_MAGIC)
+    saw_iend = False
+
+    while True:
+        if saw_iend:
+            # A chunk after IEND, or bytes after IEND, is not allowed.
+            raise EntryProblem("data found after the IEND chunk")
+        if offset + _CHUNK_HEADER > len(blob):
+            raise EntryProblem("truncated PNG: chunk header runs past the end")
+        payload_len = _u32be(blob[offset : offset + 4])
+        chunk_type = blob[offset + 4 : offset + 8]
+        payload_start = offset + _CHUNK_HEADER
+        payload_end = payload_start + payload_len
+        chunk_end = payload_end + _CHUNK_FOOTER
+        if chunk_end > len(blob):
+            raise EntryProblem(
+                f"truncated PNG: {chunk_type.decode('latin-1')} chunk "
+                f"runs past the end of the file"
+            )
+
+        payload = blob[payload_start:payload_end]
+        stored_crc = _u32be(blob[payload_end:chunk_end])
+        if not _crc_matches(chunk_type, payload, stored_crc):
+            raise EntryProblem(
+                f"bad CRC in {chunk_type.decode('latin-1')} chunk"
+            )
+
+        if offset == len(PNG_MAGIC):
+            if chunk_type != b"IHDR":
+                raise EntryProblem("first chunk is not IHDR")
+            if payload_len != _IHDR_PAYLOAD:
+                raise EntryProblem(
+                    f"IHDR payload is {payload_len} bytes, expected "
+                    f"{_IHDR_PAYLOAD}"
+                )
+            width = _u32be(payload[0:4])
+            height = _u32be(payload[4:8])
+            if width == 0 or height == 0:
+                raise EntryProblem("PNG has a zero width or height")
+            if width > MAX_SIDE_PIXELS or height > MAX_SIDE_PIXELS:
+                raise EntryProblem(
+                    f"dimensions {width}x{height} exceed the "
+                    f"{MAX_SIDE_PIXELS}x{MAX_SIDE_PIXELS} limit"
+                )
+
+        if chunk_type == b"IEND":
+            if payload_len != 0:
+                raise EntryProblem(
+                    f"IEND chunk carries {payload_len} payload bytes, "
+                    f"expected 0"
+                )
+            saw_iend = True
+            if chunk_end != len(blob):
+                raise EntryProblem("trailing bytes after the IEND chunk")
+            break
+
+        offset = chunk_end
+
+    if not saw_iend:
+        raise EntryProblem("PNG has no IEND chunk")
     return width, height
 
 
-def main() -> int:
-    # MAKEFUN_OUTPUT_DIR is a directory; default /output.
+def _source_path() -> Path:
+    """The repository's entry.png, sitting beside this program."""
+    return Path(__file__).resolve().parent / "entry.png"
+
+
+def _output_path() -> Path:
+    """Where make.fun wants the entry: $MAKEFUN_OUTPUT_DIR/entry.png."""
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-    path = os.path.join(out_dir, "entry.png")
+    return Path(out_dir) / "entry.png"
 
-    # The entry image ships in this repository, beside main.py.
-    here = os.path.dirname(os.path.abspath(__file__))
-    src = os.path.join(here, "entry.png")
-    with open(src, "rb") as fh:
-        data = fh.read()
 
-    # Validate before writing.
-    if len(data) > MAX_BYTES:
-        print(f"error: entry.png is {len(data)} bytes, max {MAX_BYTES}",
-              file=sys.stderr)
-        return 1
+def run() -> int:
+    """Read, validate, deliver, and re-verify the entry image."""
+    source = _source_path()
     try:
-        width, height = png_dimensions(data)
-    except ValueError as exc:
+        original = source.read_bytes()
+    except OSError as exc:
+        print(f"error: cannot read {source}: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        width, height = examine_png(original)
+    except EntryProblem as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    if width > MAX_DIM or height > MAX_DIM:
-        print(f"error: entry.png is {width}x{height}, max {MAX_DIM}x{MAX_DIM}",
-              file=sys.stderr)
+
+    target = _output_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(original)
+        written = target.read_bytes()
+    except OSError as exc:
+        print(f"error: cannot write {target}: {exc}", file=sys.stderr)
         return 1
 
-    os.makedirs(out_dir, exist_ok=True)
-    with open(path, "wb") as fh:
-        fh.write(data)
-
-    # Re-read and confirm byte-identical to the repository's entry.png.
-    with open(path, "rb") as fh:
-        written = fh.read()
-    if written != data:
-        print("error: written file is not byte-identical to entry.png",
-              file=sys.stderr)
-        return 1
-    w2, h2 = png_dimensions(written)
-    if (w2, h2) != (width, height) or len(written) > MAX_BYTES:
-        print("error: re-read verification failed", file=sys.stderr)
+    if written != original:
+        print(
+            f"error: written copy {target} differs from {source}",
+            file=sys.stderr,
+        )
         return 1
 
-    print(f"wrote {path}: {len(data)} bytes, {width}x{height}")
+    try:
+        re_width, re_height = examine_png(written)
+    except EntryProblem as exc:
+        print(f"error: written copy failed validation: {exc}", file=sys.stderr)
+        return 1
+    if (re_width, re_height) != (width, height):
+        print(
+            "error: written copy dimensions "
+            f"{re_width}x{re_height} differ from source {width}x{height}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        f"entry.png OK: {len(original)} bytes, {width}x{height}, "
+        f"delivered to {target}"
+    )
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run())
